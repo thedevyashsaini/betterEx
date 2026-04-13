@@ -4,7 +4,8 @@ Chrome extension for Google Forms that sends question batches to a local OpenCod
 
 ## Usage
 
-1. Start your OpenCode server locally on `http://127.0.0.1:4096`.
+0. Add C:\Users\<username>\AppData\Local\OpenCode to your environment path variable 
+1. Start your OpenCode server locally on `http://127.0.0.1:4096` ( `opencode-cli.exe serve` ).
 2. Load `betterEx/` as an unpacked extension in Chrome.
 3. Open a Google Form.
 4. Press `Alt+G` to solve the next chunk of questions.
