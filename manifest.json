@@ -1,0 +1,22 @@
+{
+  "manifest_version": 3,
+  "name": "betterEx",
+  "version": "1.0.0",
+  "description": "Google Forms autofill extension powered by a local OpenCode server.",
+  "permissions": ["storage"],
+  "host_permissions": [
+    "https://docs.google.com/forms/*",
+    "http://127.0.0.1:4096/*",
+    "http://localhost:4096/*"
+  ],
+  "background": {
+    "service_worker": "background.js"
+  },
+  "content_scripts": [
+    {
+      "matches": ["https://docs.google.com/forms/*"],
+      "js": ["content.js"],
+      "run_at": "document_idle"
+    }
+  ]
+}
