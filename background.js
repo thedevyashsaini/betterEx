@@ -65,21 +65,40 @@ function extractModelIds(provider) {
   return out;
 }
 
-function chooseModel(connectedProviders, providerById) {
+function getModelCandidates(connectedProviders, providerById) {
   const connected = new Set(connectedProviders || []);
+  const candidates = [];
 
   for (const choice of MODEL_PREFERENCES) {
-    if (!connected.has(choice.providerID)) continue;
     const modelIds = extractModelIds(providerById[choice.providerID]);
-    if (modelIds.length === 0 || modelIds.includes(choice.modelID)) {
-      return choice;
+    const modelLooksAvailable = modelIds.length === 0 || modelIds.includes(choice.modelID);
+    if (!modelLooksAvailable) continue;
+
+    // Prefer connected providers first, but keep disconnected ones as fallback.
+    if (connected.has(choice.providerID)) {
+      candidates.unshift(choice);
+    } else {
+      candidates.push(choice);
     }
   }
 
-  throw new Error("Neither openai/gpt-5.4 nor github-copilot/gpt-5.3-codex is available on the OpenCode server.");
+  const deduped = [];
+  const seen = new Set();
+  for (const candidate of candidates) {
+    const key = `${candidate.providerID}/${candidate.modelID}`;
+    if (seen.has(key)) continue;
+    seen.add(key);
+    deduped.push(candidate);
+  }
+
+  if (!deduped.length) {
+    throw new Error("Neither openai/gpt-5.4 nor github-copilot/gpt-5.3-codex is available on the OpenCode server.");
+  }
+
+  return deduped;
 }
 
-async function getSelectedModel() {
+async function getModelCandidatesFromServer() {
   const [providerInfo, configProviders] = await Promise.all([
     opencodeFetch("/provider"),
     opencodeFetch("/config/providers"),
@@ -91,7 +110,7 @@ async function getSelectedModel() {
       .map((provider) => [provider.id, provider]),
   );
 
-  return chooseModel(providerInfo.connected || [], providerById);
+  return getModelCandidates(providerInfo.connected || [], providerById);
 }
 
 async function ensureSession() {
@@ -113,6 +132,14 @@ async function ensureSession() {
   });
 
   await setStorage({ [SESSION_STORAGE_KEY]: created.id });
+  return created.id;
+}
+
+async function createFreshSession() {
+  const created = await opencodeFetch("/session", {
+    method: "POST",
+    body: JSON.stringify({}),
+  });
   return created.id;
 }
 
@@ -185,6 +212,95 @@ function buildPromptParts(questions) {
   return parts;
 }
 
+function guessMimeTypeFromDataUrl(dataUrl, fallback = "image/jpeg") {
+  const match = String(dataUrl || "").match(/^data:([^;]+);base64,/i);
+  if (match && match[1]) return match[1];
+  return fallback;
+}
+
+async function fetchAsDataUrl(url, fallbackMime) {
+  const response = await fetch(url, { credentials: "include" });
+  if (!response.ok) {
+    throw new Error(`Image fetch failed (${response.status})`);
+  }
+
+  const buffer = await response.arrayBuffer();
+  const contentType = response.headers.get("content-type") || fallbackMime || "image/jpeg";
+  const bytes = new Uint8Array(buffer);
+  let binary = "";
+  for (let i = 0; i < bytes.length; i += 1) {
+    binary += String.fromCharCode(bytes[i]);
+  }
+  const b64 = btoa(binary);
+  return `data:${contentType};base64,${b64}`;
+}
+
+async function buildProviderSafeParts(model, parts) {
+  if (!model || model.providerID !== "github-copilot") {
+    return parts;
+  }
+
+  const safeParts = [];
+  for (const part of parts) {
+    if (!part || part.type !== "file") {
+      safeParts.push(part);
+      continue;
+    }
+
+    const url = String(part.url || "").trim();
+    if (!url) {
+      continue;
+    }
+
+    if (url.startsWith("data:")) {
+      safeParts.push(part);
+      continue;
+    }
+
+    try {
+      const dataUrl = await fetchAsDataUrl(url, part.mime || guessMimeType(url));
+      safeParts.push({
+        ...part,
+        mime: guessMimeTypeFromDataUrl(dataUrl, part.mime || guessMimeType(url)),
+        url: dataUrl,
+      });
+    } catch (error) {
+      console.warn(`[betterEx] Skipping image for Copilot request: ${url} (${error.message || error})`);
+    }
+  }
+
+  return safeParts;
+}
+
+function enforceCopilotImageRules(model, parts) {
+  if (!model || model.providerID !== "github-copilot") {
+    return parts;
+  }
+
+  const out = [];
+  for (const part of parts || []) {
+    if (!part || part.type !== "file") {
+      out.push(part);
+      continue;
+    }
+
+    const url = String(part.url || "").trim();
+    const mime = String(part.mime || "").toLowerCase();
+    const isDataUrl = url.startsWith("data:");
+    const isImageMime = mime.startsWith("image/");
+
+    // Copilot rejects external image URLs. Keep only inline data URLs.
+    if (isDataUrl && isImageMime) {
+      out.push(part);
+      continue;
+    }
+
+    console.warn(`[betterEx] Dropping unsupported Copilot file part: ${url.slice(0, 80)}`);
+  }
+
+  return out;
+}
+
 function extractFinalText(response) {
   const parts = Array.isArray(response.parts) ? response.parts : [];
   for (const part of parts) {
@@ -255,20 +371,14 @@ function parseStructuredAnswers(response) {
   throw new Error("OpenCode did not return parseable structured answers.");
 }
 
-async function solveQuestions(questions, requestId) {
-  const controller = new AbortController();
-  if (requestId) {
-    const prior = activeSolveControllers.get(requestId);
-    if (prior) prior.abort();
-    activeSolveControllers.set(requestId, controller);
-  }
-
-  try {
-  const [sessionId, model] = await Promise.all([ensureSession(), getSelectedModel()]);
+async function sendSolvePrompt(sessionId, model, questions, signal) {
+  const baseParts = buildPromptParts(questions);
+  const providerSafeParts = await buildProviderSafeParts(model, baseParts);
+  const finalParts = enforceCopilotImageRules(model, providerSafeParts);
 
   const response = await opencodeFetch(`/session/${encodeURIComponent(sessionId)}/message`, {
     method: "POST",
-    signal: controller.signal,
+    signal,
     body: JSON.stringify({
       model,
       system: "Return structured output only. Do not add explanations outside the structured response.",
@@ -302,15 +412,49 @@ async function solveQuestions(questions, requestId) {
           additionalProperties: false,
         },
       },
-      parts: buildPromptParts(questions),
+      parts: finalParts,
     }),
   });
 
-  return {
-    sessionId,
-    model,
-    answers: parseStructuredAnswers(response),
-  };
+  if (response && response.info && response.info.error) {
+    const err = response.info.error;
+    const msg = err && err.data && err.data.message ? err.data.message : JSON.stringify(err);
+    throw new Error(`OpenCode message error (${model.providerID}/${model.modelID}): ${msg}`);
+  }
+
+  return response;
+}
+
+async function solveQuestions(questions, requestId) {
+  const controller = new AbortController();
+  if (requestId) {
+    const prior = activeSolveControllers.get(requestId);
+    if (prior) prior.abort();
+    activeSolveControllers.set(requestId, controller);
+  }
+
+  try {
+    const modelCandidates = await getModelCandidatesFromServer();
+
+    const errors = [];
+    for (const model of modelCandidates) {
+      try {
+        // Use a fresh session for each solve attempt so old message history
+        // cannot carry forward unsupported external image URLs.
+        const sessionId = await createFreshSession();
+        const response = await sendSolvePrompt(sessionId, model, questions, controller.signal);
+        return {
+          sessionId,
+          model,
+          answers: parseStructuredAnswers(response),
+        };
+      } catch (error) {
+        if (error && error.name === "AbortError") throw error;
+        errors.push(`[${model.providerID}/${model.modelID}] ${error.message || String(error)}`);
+      }
+    }
+
+    throw new Error(`All model attempts failed. ${errors.join(" | ")}`);
   } finally {
     if (requestId && activeSolveControllers.get(requestId) === controller) {
       activeSolveControllers.delete(requestId);

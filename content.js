@@ -1,9 +1,20 @@
 const PROGRESS_STORAGE_KEY = "betterEx.googleForm.progress.v1";
 const QUESTIONS_PER_RUN = 12;
 const MAX_IMAGES_PER_QUESTION = 2;
+const MAX_MOODLE_IMAGES_PER_QUESTION = 4;
 const STATUS_DOT_ID = "betterex-status-dot";
 let activeRequestId = null;
 let requestCounter = 0;
+
+function isGoogleFormPage() {
+  return location.hostname.includes("docs.google.com") && location.pathname.startsWith("/forms/");
+}
+
+function isMoodlePage() {
+  if (location.hostname.includes("betamoodle.iiitvadodara.ac.in")) return true;
+  if (location.hostname.includes("sandbox.moodledemo.net")) return true;
+  return location.pathname.includes("/mod/quiz/") || location.pathname.includes("/question/");
+}
 
 function isEditableElement(el) {
   if (!el) return false;
@@ -42,6 +53,14 @@ function setStatusDotVisible(visible) {
   dot.style.opacity = visible ? "0.82" : "0";
 }
 
+function getExtensionRuntime() {
+  const runtime = globalThis.chrome && globalThis.chrome.runtime;
+  if (!runtime || typeof runtime.sendMessage !== "function") {
+    return null;
+  }
+  return runtime;
+}
+
 function createRequestId() {
   requestCounter += 1;
   return `req-${Date.now()}-${requestCounter}`;
@@ -63,6 +82,24 @@ function extractQuestionImages(block) {
   }
 
   return out.slice(0, MAX_IMAGES_PER_QUESTION);
+}
+
+function extractMoodleQuestionImages(container) {
+  const images = Array.from((container || document).querySelectorAll("img"));
+  const seen = new Set();
+  const out = [];
+
+  for (const img of images) {
+    const src = String(img.currentSrc || img.src || "").trim();
+    if (!src || src.startsWith("data:") || seen.has(src)) continue;
+    seen.add(src);
+    out.push({
+      src,
+      alt: normalizeText(img.getAttribute("alt") || ""),
+    });
+  }
+
+  return out.slice(0, MAX_MOODLE_IMAGES_PER_QUESTION);
 }
 
 function extractGoogleFormQuestions() {
@@ -133,6 +170,69 @@ function extractGoogleFormQuestions() {
         images,
       });
     }
+  });
+
+  return questions;
+}
+
+function extractMoodleQuestions() {
+  const blocks = Array.from(document.querySelectorAll(".formulation.clearfix"));
+  const questions = [];
+
+  blocks.forEach((block, index) => {
+    const questionTextElement = block.querySelector(".qtext");
+    const questionText = normalizeText(questionTextElement ? questionTextElement.textContent : "") || "Question text unavailable";
+    const questionImages = extractMoodleQuestionImages(questionTextElement || block);
+
+    const textInput = block.querySelector('input[type="text"], textarea');
+    if (textInput) {
+      questions.push({
+        index: index + 1,
+        question: questionText,
+        type: "text",
+        input: textInput,
+        images: questionImages,
+      });
+      return;
+    }
+
+    const answerOptions = [];
+    const seenInputs = new WeakSet();
+    const seenKeys = new Set();
+    const optionRows = block.querySelectorAll(".ablock .answer .d-flex, .ablock .answer div[class^='r']");
+
+    optionRows.forEach((optionEl) => {
+      const inputEl = optionEl.querySelector('input[type="radio"], input[type="checkbox"]')
+        || optionEl.parentElement?.querySelector('input[type="radio"], input[type="checkbox"]');
+      const optionTextElement = optionEl.querySelector(".flex-fill, .ms-1") || optionEl;
+
+      if (!inputEl || !optionTextElement) return;
+      if (seenInputs.has(inputEl)) return;
+
+      const text = normalizeText(optionTextElement.textContent);
+      if (!text) return;
+
+      const optionKey = `${inputEl.type || ""}|${inputEl.name || ""}|${inputEl.value || ""}|${text}`;
+      if (seenKeys.has(optionKey)) return;
+
+      seenInputs.add(inputEl);
+      seenKeys.add(optionKey);
+      answerOptions.push({ text, element: inputEl });
+    });
+
+    if (!answerOptions.length) return;
+
+    const selectionType = answerOptions.some((option) => option.element && option.element.type === "checkbox")
+      ? "multi-choice"
+      : "single-choice";
+
+    questions.push({
+      index: index + 1,
+      question: questionText,
+      type: selectionType,
+      options: answerOptions,
+      images: questionImages,
+    });
   });
 
   return questions;
@@ -414,15 +514,21 @@ function fillAnswers(questions, answers) {
 
 function requestAnswersFromBackground(questions, requestId) {
   return new Promise((resolve, reject) => {
-    chrome.runtime.sendMessage(
+    const runtime = getExtensionRuntime();
+    if (!runtime) {
+      reject(new Error("Extension runtime unavailable. Reload the page after reloading the extension."));
+      return;
+    }
+
+    runtime.sendMessage(
       {
         type: "betterEx.solveQuestions",
         requestId,
         questions: serializeQuestions(questions),
       },
       (response) => {
-        if (chrome.runtime.lastError) {
-          reject(new Error(chrome.runtime.lastError.message));
+        if (runtime.lastError) {
+          reject(new Error(runtime.lastError.message));
           return;
         }
         if (!response || !response.ok) {
@@ -445,20 +551,24 @@ function abortActiveSolve() {
   setStatusDotVisible(false);
   if (!requestId) return;
 
-  chrome.runtime.sendMessage(
+  const runtime = getExtensionRuntime();
+  if (!runtime) return;
+
+  runtime.sendMessage(
     {
       type: "betterEx.abortSolve",
       requestId,
     },
     () => {
-      if (chrome.runtime.lastError) {
-        console.warn("[betterEx] Abort request warning:", chrome.runtime.lastError.message);
+      if (runtime.lastError) {
+        console.warn("[betterEx] Abort request warning:", runtime.lastError.message);
       }
     },
   );
 }
 
 async function handleGoogleFormWithAI() {
+  if (!isGoogleFormPage()) return;
   setStatusDotVisible(false);
   if (activeRequestId) return;
   const questions = extractGoogleFormQuestions();
@@ -538,6 +648,46 @@ async function handleGoogleFormWithAI() {
   }
 }
 
+async function handleMoodleWithAI() {
+  if (!isMoodlePage()) return;
+  setStatusDotVisible(false);
+  if (activeRequestId) return;
+
+  const questions = extractMoodleQuestions();
+  if (!questions.length) {
+    setStatusDotVisible(false);
+    return;
+  }
+
+  const runQuestions = questions;
+  setStatusDotVisible(true);
+  const requestId = createRequestId();
+  activeRequestId = requestId;
+
+  try {
+    const result = await requestAnswersFromBackground(runQuestions, requestId);
+    if (activeRequestId !== requestId) return;
+
+    const answers = normalizeAnswers(result.answers, runQuestions);
+    if (!answers.length) {
+      throw new Error("No usable answers returned from OpenCode.");
+    }
+
+    fillAnswers(runQuestions, answers);
+    activeRequestId = null;
+    setStatusDotVisible(false);
+  } catch (error) {
+    if (activeRequestId !== requestId) return;
+    activeRequestId = null;
+    if (error && error.message === "Solve aborted") {
+      setStatusDotVisible(false);
+      return;
+    }
+    setStatusDotVisible(false);
+    console.error("[betterEx] Failed to solve Moodle page:", error);
+  }
+}
+
 document.addEventListener("keydown", (event) => {
   if (String(event.key || "").toLowerCase() !== "g") return;
   if (isEditableElement(document.activeElement)) return;
@@ -551,8 +701,16 @@ document.addEventListener("keydown", (event) => {
   if (!event.altKey || event.ctrlKey || event.metaKey) return;
 
   event.preventDefault();
-  console.log("[betterEx] Alt+G pressed. Processing Google Form...");
-  handleGoogleFormWithAI();
+  if (isGoogleFormPage()) {
+    console.log("[betterEx] Alt+G pressed. Processing Google Form...");
+    handleGoogleFormWithAI();
+    return;
+  }
+
+  if (isMoodlePage()) {
+    console.log("[betterEx] Alt+G pressed. Processing Moodle question page...");
+    handleMoodleWithAI();
+  }
 });
 
 ensureStatusDot();

@@ -6,6 +6,11 @@
   "permissions": ["storage"],
   "host_permissions": [
     "https://docs.google.com/forms/*",
+    "*://*/mod/quiz/*",
+    "*://*/question/*",
+    "https://betamoodle.iiitvadodara.ac.in/*",
+    "https://tds-legend.moodlecloud.com/*",
+    "https://sandbox.moodledemo.net/*",
     "http://127.0.0.1:4096/*",
     "http://localhost:4096/*"
   ],
@@ -14,7 +19,14 @@
   },
   "content_scripts": [
     {
-      "matches": ["https://docs.google.com/forms/*"],
+      "matches": [
+        "https://docs.google.com/forms/*",
+        "*://*/mod/quiz/*",
+        "*://*/question/*",
+        "https://betamoodle.iiitvadodara.ac.in/*",
+        "https://tds-legend.moodlecloud.com/*",
+        "https://sandbox.moodledemo.net/*"
+      ],
       "js": ["content.js"],
       "run_at": "document_idle"
     }
